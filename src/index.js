@@ -106,12 +106,24 @@ async function handleRequest(request) {
     const response = await fetch(new_url.href, {
       method: request.method,
       headers: new_headers,
-      body: request.method !== 'GET' ? request.body : undefined
+      body: request.method !== 'GET' ? request.body : undefined,
+      redirect: 'manual' // 处理重定向，避免自动跟随导致的问题
     });
 
-    // 克隆响应以便处理内容
-    const response_clone = response.clone();
-    
+    // 处理重定向
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (location) {
+        const modified_location = modifyUrl(location, host_prefix, effective_host);
+        const new_res_headers = new Headers(response.headers);
+        new_res_headers.set('location', modified_location);
+        return new Response(null, {
+          status: response.status,
+          headers: new_res_headers
+        });
+      }
+    }
+
     // 设置新的响应头
     const new_response_headers = new Headers(response.headers);
     new_response_headers.set('access-control-allow-origin', '*');
@@ -120,11 +132,30 @@ async function handleRequest(request) {
     new_response_headers.delete('content-security-policy');
     new_response_headers.delete('content-security-policy-report-only');
     new_response_headers.delete('clear-site-data');
-    
-    // 处理响应内容，替换域名引用，使用有效主机名来决定域名后缀
-    const modified_body = await modifyResponse(response_clone, host_prefix, effective_host);
 
-    return new Response(modified_body, {
+    // 只处理 200 OK 且是文本类型的响应内容
+    const content_type = response.headers.get('content-type') || '';
+    const is_text = content_type.includes('text/') || 
+                    content_type.includes('application/json') || 
+                    content_type.includes('application/javascript') || 
+                    content_type.includes('application/xml');
+
+    if (response.status === 200 && is_text) {
+      // 如果要修改内容，必须移除这些头，因为内容会被解压且长度会变化
+      new_response_headers.delete('content-encoding');
+      new_response_headers.delete('content-length');
+      
+      let text = await response.text();
+      text = await modifyText(text, host_prefix, effective_host);
+      
+      return new Response(text, {
+        status: response.status,
+        headers: new_response_headers
+      });
+    }
+
+    // 对于非文本或非 200 响应，直接返回原始流
+    return new Response(response.body, {
       status: response.status,
       headers: new_response_headers
     });
@@ -144,16 +175,8 @@ function getProxyPrefix(host) {
   return null;
 }
 
-async function modifyResponse(response, host_prefix, effective_hostname) {
-  // 只处理文本内容
-  const content_type = response.headers.get('content-type') || '';
-  if (!content_type.includes('text/') && !content_type.includes('application/json') && 
-      !content_type.includes('application/javascript') && !content_type.includes('application/xml')) {
-    return response.body;
-  }
-
-  let text = await response.text();
-  
+// 修改文本中的域名引用
+async function modifyText(text, host_prefix, effective_hostname) {
   // 使用有效主机名获取域名后缀部分（用于构建完整的代理域名）
   const domain_suffix = effective_hostname.substring(host_prefix.length);
   
@@ -178,25 +201,24 @@ async function modifyResponse(response, host_prefix, effective_hostname) {
     );
   }
 
-  // 处理相对路径，使用有效主机名
-  // 所有模式下都生效
-  // 注意：这个替换可能会导致问题，因为它会匹配所有以 / 开头的路径
-  // 许多 JS/CSS 引用可能是相对路径，但也可能是根路径
-  // 如果这里强制替换为绝对路径，可能会导致 URL 拼接错误
-  // 例如：如果原文本是 "/assets/foo.js"，它会被替换为 "https://github-githubassets-com-gh.xxx.com/assets/foo.js"
-  // 如果原文本已经是 "https://github-githubassets-com-gh.xxx.com/assets/foo.js" (被上面的循环替换了)，这里不会再匹配（因为前面的 http... 不符合 (?<=["'])）
-  // 但是，如果原文本是相对路径，如 "/assets/foo.js"，并且当前页面已经是代理页面
-  // 浏览器会自动将其解析为当前域名下的路径，通常不需要我们手动替换
-  // 手动替换反而可能导致像 `https://domain.com/assetshttps://domain.com/foo.js` 这种奇怪的 URL
-  // 除非是为了处理某些特定的动态加载脚本，否则应该谨慎使用
-  
-  // 暂时注释掉这段代码，看看是否解决 "URL 拼接" 问题
-  /*
-  text = text.replace(
-    /(?<=["'])\/(?!\/|[a-zA-Z]+:)/g,
-    `https://${effective_hostname}/`
-  );
-  */
-
   return text;
+}
+
+// 修改 URL（用于重定向等）
+function modifyUrl(url_str, host_prefix, effective_hostname) {
+  try {
+    const url = new URL(url_str);
+    const domain_suffix = effective_hostname.substring(host_prefix.length);
+    
+    for (const [original_domain, _] of Object.entries(domain_mappings)) {
+      if (url.host === original_domain) {
+        const current_prefix = original_domain.replace(/\./g, '-') + '-gh.';
+        url.host = `${current_prefix}${domain_suffix}`;
+        break;
+      }
+    }
+    return url.href;
+  } catch (e) {
+    return url_str;
+  }
 }
